@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tearable Proto v2 — Plastic Feel</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a0a0a; overflow: hidden; font-family: system-ui, sans-serif; color: #888; }
+  canvas { display: block; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  .hud { position: fixed; bottom: 16px; left: 16px; font-size: 12px; letter-spacing: 0.05em; pointer-events: none; opacity: 0.6; }
+  .hud kbd { background: #222; padding: 2px 6px; border-radius: 3px; color: #ccc; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hud">
+  click + drag = grab &amp; pull &nbsp;·&nbsp; pulls hard enough = tears &nbsp;·&nbsp; <kbd>R</kbd> reset
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+  // ---- Page texture (offscreen) ----
+  const pageW = 720, pageH = 960;
+  const page = document.createElement('canvas');
+  page.width = pageW; page.height = pageH;
+  const pctx = page.getContext('2d');
+
+  function paintPage() {
+    const grad = pctx.createLinearGradient(0, 0, 0, pageH);
+    grad.addColorStop(0, '#fdfaf3');
+    grad.addColorStop(1, '#f0e9d8');
+    pctx.fillStyle = grad;
+    pctx.fillRect(0, 0, pageW, pageH);
+    pctx.strokeStyle = '#1a1a1a';
+    pctx.lineWidth = 4;
+    pctx.strokeRect(20, 20, pageW - 40, pageH - 40);
+    pctx.fillStyle = '#0a0a0a';
+    pctx.font = 'bold 96px "Times New Roman", serif';
+    pctx.textAlign = 'center';
+    pctx.fillText('TEARABLE', pageW / 2, 180);
+    pctx.font = 'italic 44px "Times New Roman", serif';
+    pctx.fillText('— plastic feel —', pageW / 2, 234);
+    pctx.font = '22px Georgia, serif';
+    pctx.textAlign = 'left';
+    const lines = [
+      'Grab the page. Pull it.',
+      'Stretch propagates through the mesh.',
+      'When local strain exceeds break ratio,',
+      'the constraint snaps — but only there.',
+      '',
+      'Stretched regions whiten. Slack regions',
+      'darken. The eye reads tension.',
+      '',
+      'No instant cuts. Only physics.',
+    ];
+    let y = 320;
+    for (const line of lines) { pctx.fillText(line, 80, y); y += 38; }
+    pctx.font = '14px monospace';
+    pctx.fillStyle = '#888';
+    pctx.textAlign = 'right';
+    pctx.fillText('§ 02 — verlet + strain shading', pageW - 60, pageH - 50);
+  }
+  paintPage();
+
+  // ---- Cloth params ----
+  const COLS = 50;
+  const ROWS = 70;
+  const GRAVITY = 380;
+  const DAMPING = 0.018;
+  const ITERATIONS = 10;
+  const STIFFNESS = 0.28;          // soft — plastic-like
+  const BEND_STIFFNESS = 0.06;     // skip-1 neighbor (memory)
+  const TEAR_RATIO = 5.5;          // break when length > rest * ratio
+  const FADE_RATIO = 2.4;          // start whitening here
+
+  const GRAB_RADIUS = 38;
+  const GRAB_SOFTNESS = 0.45;      // how strongly grabbed pts follow cursor
+
+  let particles = [];
+  let constraints = [];
+  let bends = [];
+  let spacing = 10;
+
+  class Particle {
+    constructor(x, y, col, row) {
+      this.x = x; this.y = y; this.px = x; this.py = y;
+      this.col = col; this.row = row;
+      this.pinned = row === 0;
+      this.grabOffsetX = 0; this.grabOffsetY = 0; this.grabbed = false;
+    }
+    update(dt) {
+      if (this.pinned) return;
+      if (this.grabbed) return;
+      const vx = (this.x - this.px) * (1 - DAMPING);
+      const vy = (this.y - this.py) * (1 - DAMPING);
+      this.px = this.x; this.py = this.y;
+      this.x += vx;
+      this.y += vy + GRAVITY * dt * dt;
+    }
+  }
+
+  class Constraint {
+    constructor(a, b, stiffness) {
+      this.a = a; this.b = b;
+      this.len = Math.hypot(a.x - b.x, a.y - b.y);
+      this.k = stiffness;
+      this.dead = false;
+      this.strain = 0; // ratio of current/rest, smoothed
+    }
+    solve() {
+      if (this.dead) return;
+      const dx = this.b.x - this.a.x;
+      const dy = this.b.y - this.a.y;
+      const d = Math.hypot(dx, dy) || 0.0001;
+      const ratio = d / this.len;
+      // smoothed strain for shading (don't recompute every iter)
+      this.strain = this.strain * 0.6 + ratio * 0.4;
+      if (ratio > TEAR_RATIO) { this.dead = true; return; }
+      const diff = (d - this.len) / d * this.k;
+      const ox = dx * diff, oy = dy * diff;
+      if (!this.a.pinned && !this.a.grabbed) { this.a.x += ox; this.a.y += oy; }
+      if (!this.b.pinned && !this.b.grabbed) { this.b.x -= ox; this.b.y -= oy; }
+    }
+  }
+
+  function build() {
+    particles = [];
+    constraints = [];
+    bends = [];
+    spacing = Math.min((W * 0.7) / COLS, (H * 0.82) / ROWS);
+    const meshW = COLS * spacing;
+    const meshH = ROWS * spacing;
+    const originX = (W - meshW) / 2;
+    const originY = (H - meshH) / 2 - meshH * 0.05;
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        particles.push(new Particle(originX + c * spacing, originY + r * spacing, c, r));
+      }
+    }
+    const idx = (c, r) => r * COLS + c;
+    // structural
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (c < COLS - 1) constraints.push(new Constraint(particles[idx(c, r)], particles[idx(c + 1, r)], STIFFNESS));
+        if (r < ROWS - 1) constraints.push(new Constraint(particles[idx(c, r)], particles[idx(c, r + 1)], STIFFNESS));
+      }
+    }
+    // bend (skip 1) — memory / page-like resistance
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        if (c < COLS - 2) bends.push(new Constraint(particles[idx(c, r)], particles[idx(c + 2, r)], BEND_STIFFNESS));
+        if (r < ROWS - 2) bends.push(new Constraint(particles[idx(c, r)], particles[idx(c, r + 2)], BEND_STIFFNESS));
+      }
+    }
+  }
+
+  // ---- Mouse: grab + pull ----
+  const mouse = { x: 0, y: 0, down: false };
+  let grabbedSet = [];
+
+  function pickGrab() {
+    grabbedSet = [];
+    const r2 = GRAB_RADIUS * GRAB_RADIUS;
+    for (const p of particles) {
+      if (p.pinned) continue;
+      const dx = p.x - mouse.x, dy = p.y - mouse.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < r2) {
+        p.grabbed = true;
+        p.grabOffsetX = p.x - mouse.x;
+        p.grabOffsetY = p.y - mouse.y;
+        grabbedSet.push(p);
+      }
+    }
+  }
+  function releaseGrab() {
+    for (const p of grabbedSet) {
+      p.grabbed = false;
+      // hand momentum back so cloth keeps moving naturally
+    }
+    grabbedSet = [];
+  }
+  function applyGrab() {
+    if (!grabbedSet.length) return;
+    for (const p of grabbedSet) {
+      const tx = mouse.x + p.grabOffsetX;
+      const ty = mouse.y + p.grabOffsetY;
+      // soft follow — gives the rubbery feel rather than locking
+      p.x += (tx - p.x) * GRAB_SOFTNESS;
+      p.y += (ty - p.y) * GRAB_SOFTNESS;
+      // keep verlet history close so release doesn't pop
+      p.px = p.x - (mouse.x - p.x + p.grabOffsetX) * 0.1;
+      p.py = p.y - (mouse.y - p.y + p.grabOffsetY) * 0.1;
+    }
+  }
+
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  canvas.addEventListener('mousedown', e => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+    mouse.down = true;
+    pickGrab();
+  });
+  canvas.addEventListener('mouseup', () => { mouse.down = false; releaseGrab(); });
+  canvas.addEventListener('mouseleave', () => { mouse.down = false; releaseGrab(); });
+  canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+  });
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0], r = canvas.getBoundingClientRect();
+    mouse.x = t.clientX - r.left; mouse.y = t.clientY - r.top;
+    mouse.down = true; pickGrab();
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0], r = canvas.getBoundingClientRect();
+    mouse.x = t.clientX - r.left; mouse.y = t.clientY - r.top;
+  }, { passive: false });
+  canvas.addEventListener('touchend', () => { mouse.down = false; releaseGrab(); });
+
+  window.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') { releaseGrab(); build(); } });
+
+  // ---- Triangle texture warp + strain shading ----
+  function drawTexturedTri(s0x, s0y, s1x, s1y, s2x, s2y, d0x, d0y, d1x, d1y, d2x, d2y, strain) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(d0x, d0y); ctx.lineTo(d1x, d1y); ctx.lineTo(d2x, d2y);
+    ctx.closePath(); ctx.clip();
+
+    const sx1 = s1x - s0x, sy1 = s1y - s0y;
+    const sx2 = s2x - s0x, sy2 = s2y - s0y;
+    const dx1 = d1x - d0x, dy1 = d1y - d0y;
+    const dx2 = d2x - d0x, dy2 = d2y - d0y;
+    const det = sx1 * sy2 - sx2 * sy1;
+    if (Math.abs(det) < 1e-6) { ctx.restore(); return; }
+    const inv = 1 / det;
+    const a = (dx1 * sy2 - dx2 * sy1) * inv;
+    const b = (dy1 * sy2 - dy2 * sy1) * inv;
+    const c = (dx2 * sx1 - dx1 * sx2) * inv;
+    const d = (dy2 * sx1 - dy1 * sx2) * inv;
+    const e = d0x - a * s0x - c * s0y;
+    const f = d0y - b * s0x - d * s0y;
+    ctx.transform(a, b, c, d, e, f);
+    ctx.drawImage(page, 0, 0);
+    ctx.restore();
+
+    // strain shading on top, in screen space
+    if (strain > 1.05) {
+      // stretched → whiten
+      const t = Math.min(1, (strain - 1.0) / (TEAR_RATIO - 1.0));
+      const alpha = Math.min(0.55, t * 0.7);
+      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(d0x, d0y); ctx.lineTo(d1x, d1y); ctx.lineTo(d2x, d2y);
+      ctx.closePath();
+      ctx.fill();
+    } else if (strain < 0.92) {
+      // compressed → slight shadow (folds)
+      const t = Math.min(1, (0.92 - strain) / 0.4);
+      ctx.fillStyle = `rgba(0,0,0,${t * 0.25})`;
+      ctx.beginPath();
+      ctx.moveTo(d0x, d0y); ctx.lineTo(d1x, d1y); ctx.lineTo(d2x, d2y);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // ---- Render ----
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.7);
+    vg.addColorStop(0, '#181818');
+    vg.addColorStop(1, '#050505');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    const idx = (c, r) => r * COLS + c;
+    const uStep = pageW / (COLS - 1);
+    const vStep = pageH / (ROWS - 1);
+
+    // structural-edge alive maps + per-edge strain
+    const deadH = new Uint8Array(COLS * ROWS);
+    const deadV = new Uint8Array(COLS * ROWS);
+    const strainH = new Float32Array(COLS * ROWS);
+    const strainV = new Float32Array(COLS * ROWS);
+    for (const k of constraints) {
+      const a = k.a, b = k.b;
+      if (a.row === b.row) {
+        const c = Math.min(a.col, b.col);
+        const i = a.row * COLS + c;
+        if (k.dead) deadH[i] = 1;
+        strainH[i] = k.strain;
+      } else {
+        const r = Math.min(a.row, b.row);
+        const i = r * COLS + a.col;
+        if (k.dead) deadV[i] = 1;
+        strainV[i] = k.strain;
+      }
+    }
+
+    for (let r = 0; r < ROWS - 1; r++) {
+      for (let c = 0; c < COLS - 1; c++) {
+        if (deadH[r * COLS + c] || deadH[(r + 1) * COLS + c] ||
+            deadV[r * COLS + c] || deadV[r * COLS + c + 1]) continue;
+        const p00 = particles[idx(c, r)];
+        const p10 = particles[idx(c + 1, r)];
+        const p01 = particles[idx(c, r + 1)];
+        const p11 = particles[idx(c + 1, r + 1)];
+        const u0 = c * uStep, u1 = (c + 1) * uStep;
+        const v0 = r * vStep, v1 = (r + 1) * vStep;
+        // avg strain of cell's 4 structural edges
+        const sCell = 0.25 * (strainH[r * COLS + c] + strainH[(r + 1) * COLS + c] +
+                              strainV[r * COLS + c] + strainV[r * COLS + c + 1]);
+        drawTexturedTri(u0, v0, u1, v0, u1, v1, p00.x, p00.y, p10.x, p10.y, p11.x, p11.y, sCell);
+        drawTexturedTri(u0, v0, u1, v1, u0, v1, p00.x, p00.y, p11.x, p11.y, p01.x, p01.y, sCell);
+      }
+    }
+
+    // grab indicator
+    if (mouse.down) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(mouse.x, mouse.y, GRAB_RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // ---- Loop ----
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    for (const p of particles) p.update(dt);
+    applyGrab();
+    for (let i = 0; i < ITERATIONS; i++) {
+      for (const k of constraints) k.solve();
+      for (const k of bends) k.solve();
+    }
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    build();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

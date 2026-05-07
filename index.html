@@ -236,27 +236,30 @@
       if (!k.b.pinned && !k.b.grabbed) { k.b.x -= ox; k.b.y -= oy; }
     }
     pickGrab(mx, my, radius) {
+      // pinch grab — single nearest particle. Concentrates strain so rips propagate
+      // in the drag direction instead of forming a circle around a cluster.
       const r2 = radius * radius;
-      let any = false;
+      let best = null, bestD = r2;
       for (const p of this.particles) {
         if (p.pinned) continue;
         const dx = p.x - mx, dy = p.y - my;
-        if (dx * dx + dy * dy < r2) {
-          p.grabbed = true;
-          p.gox = p.x - mx; p.goy = p.y - my;
-          this.grabbed.push(p);
-          any = true;
-        }
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD) { bestD = d2; best = p; }
       }
-      return any;
+      if (best) {
+        best.grabbed = true;
+        best.gox = best.x - mx; best.goy = best.y - my;
+        this.grabbed.push(best);
+        return true;
+      }
+      return false;
     }
-    applyGrab(mx, my, soft) {
+    applyGrab(mx, my, mxPrev, myPrev) {
+      // hard follow — pinch behaves like a finger. Velocity is the cursor delta,
+      // baked into prev so on release the particle inherits flick momentum.
       for (const p of this.grabbed) {
-        const tx = mx + p.gox, ty = my + p.goy;
-        p.x += (tx - p.x) * soft;
-        p.y += (ty - p.y) * soft;
-        p.px = p.x - (mx - p.x + p.gox) * 0.1;
-        p.py = p.y - (my - p.y + p.goy) * 0.1;
+        p.x = mx + p.gox; p.y = my + p.goy;
+        p.px = mxPrev + p.gox; p.py = myPrev + p.goy;
       }
     }
     release() {
@@ -350,16 +353,20 @@
   }
 
   // ---- Layers (bottom-first render order) ----
-  const baseParams = { gravity: 380, damping: 0.018, iter: 10, stiffness: 0.28, bend: 0.06, tearRatio: 5.5, fadeRatio: 2.4 };
+  // tearRatio 3.2: real plastic ruptures around 2-4x rest. 5.5 was way too elastic.
+  // stiffness 0.40: stiffer chain so strain concentrates at pinch instead of being
+  // absorbed across many constraints — this is what lets rips propagate.
+  // bend 0.03: weak bend so the cell can rotate around the pinch and let neighbors
+  // stretch in the drag direction (instead of pleating into a circle).
+  const baseParams = { gravity: 380, damping: 0.018, iter: 8, stiffness: 0.40, bend: 0.03, tearRatio: 3.2, fadeRatio: 1.8 };
   const layers = [
-    new Cloth({ texture: texBot, cols: 50, rows: 70, params: { ...baseParams, gravity: 320, stiffness: 0.32 } }),
-    new Cloth({ texture: texMid, cols: 50, rows: 70, params: { ...baseParams, gravity: 360, stiffness: 0.30 } }),
+    new Cloth({ texture: texBot, cols: 50, rows: 70, params: { ...baseParams, gravity: 320, stiffness: 0.42 } }),
+    new Cloth({ texture: texMid, cols: 50, rows: 70, params: { ...baseParams, gravity: 360, stiffness: 0.41 } }),
     new Cloth({ texture: texTop, cols: 50, rows: 70, params: { ...baseParams } }),
   ];
 
-  const GRAB_RADIUS = 38;
-  const GRAB_SOFTNESS = 0.45;
-  const mouse = { x: 0, y: 0, down: false };
+  const GRAB_RADIUS = 28;
+  const mouse = { x: 0, y: 0, px: 0, py: 0, down: false };
   let activeLayer = null;
 
   function pickTopMost() {
@@ -379,6 +386,7 @@
   canvas.addEventListener('mousedown', e => {
     const r = canvas.getBoundingClientRect();
     mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+    mouse.px = mouse.x; mouse.py = mouse.y;
     mouse.down = true; pickTopMost();
   });
   canvas.addEventListener('mouseup', () => { mouse.down = false; releaseAll(); });
@@ -391,6 +399,7 @@
     e.preventDefault();
     const t = e.touches[0], r = canvas.getBoundingClientRect();
     mouse.x = t.clientX - r.left; mouse.y = t.clientY - r.top;
+    mouse.px = mouse.x; mouse.py = mouse.y;
     mouse.down = true; pickTopMost();
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
@@ -434,7 +443,8 @@
     const dt = Math.min(0.033, (now - last) / 1000);
     last = now;
     for (const l of layers) l.step(dt);
-    if (activeLayer) activeLayer.applyGrab(mouse.x, mouse.y, GRAB_SOFTNESS);
+    if (activeLayer) activeLayer.applyGrab(mouse.x, mouse.y, mouse.px, mouse.py);
+    mouse.px = mouse.x; mouse.py = mouse.y;
     render();
     requestAnimationFrame(frame);
   }
